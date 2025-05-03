@@ -10,6 +10,12 @@ Make sure you have python installed. To run the project:
 $ python double_pendulum.py
 ```
 
+Make sure you have `python-tk` intalled. On macOS, you can install it like this:
+
+```
+$ brew install python-tk
+```
+
 ## Controls
 
 - Press space to pause/play simulation
