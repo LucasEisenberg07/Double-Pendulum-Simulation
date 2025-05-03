@@ -60,6 +60,9 @@ class DoublePendulumApp:
         self.origin = initial_origin
 
         self.canvas = tk.Canvas(root, width=800, height=600, bg="white")
+        self.canvas.bind("<Configure>", self.on_resize)
+    
+        
         self.canvas.pack()
 
         self.line1 = self.canvas.create_line(0, 0, 0, 0, width=2, fill="blue")
@@ -85,6 +88,9 @@ class DoublePendulumApp:
         self.drag_slider.bind("<Motion>", update_drag)
 
         self.update()
+    def on_resize(self, event):
+        self.canvas.config(width=event.width, height=event.height)
+        self.origin = (event.width // 2, event.height // 2)
 
     def update(self):
         dt = 0.01
@@ -115,10 +121,10 @@ def grab(event):
     y1 *= 100
     x2 *= 100
     y2 *= 100
-    x1 += initial_origin[0]
-    y1 += initial_origin[1]
-    x2 += initial_origin[0]
-    y2 += initial_origin[1]
+    x1 += app.origin[0]
+    y1 += app.origin[1]
+    x2 += app.origin[0]
+    y2 += app.origin[1]
     
     if (x1 - 10 < event.x < x1 + 10) and (y1 - 10 < event.y < y1 + 10):
         global mouse_has_pendulum_one
