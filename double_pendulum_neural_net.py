@@ -1,14 +1,21 @@
+import torch.nn as nn
+import torch.optim as optim
+import torch
 import math
 import tkinter as tk
 import numpy as np
 import torch
-
+import os
 mouse_has_pendulum_one = False
 mouse_has_pendulum_two = False
 playing = True
 x_origin_offset = 0
 y_origin_offset = 0
 gravity = -9.81
+steps = 500
+curr_step = 0
+itterations = 200
+n_starts = 50
 initial_origin = (400 + x_origin_offset, 300 + y_origin_offset)
 
 drag_coefficient1 = 0.0
@@ -18,10 +25,216 @@ driving_amplitude2 = 0.0
 driving_frequency1 = 0.0
 driving_frequency2 = 0.0
 
+final_x2 = 0.0
+final_y2 = 0.0
+
+best_loss = 100.0
+trained_theta1 = 0.0
+trained_theta2 = 0.0
+trained_damp1 = 0.0
+trained_damp2 = 0.0
+trained_amp1 = 0.0
+trained_amp2 = 0.0
+trained_freq1 = 0.0
+trained_freq2 = 0.0
+
+target_x_global = 0.0
+target_y_global = 0.0
+
 FAST_OMEGA_THRESHOLD = 5000.0
 too_fast = False
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+def integrate_double_pendulum(
+    theta1, theta2, omega1, omega2,
+    l1, l2, m1, m2, g,
+    drag1, drag2, amp1, amp2, freq1, freq2,
+    steps, dt, device=None, save_final=False
+):
+    # Accepts all values as floats or tensors, returns final (theta1, theta2, omega1, omega2, x2, y2)
+    # device: if not None, use torch tensors on this device, else use floats
+    if device is not None:
+        def to_tensor(x, requires_grad=False):
+            # Use as_tensor to preserve computation graph if x is already a tensor
+            return torch.as_tensor(x, dtype=torch.float32, device=device)
+        # Only state variables need gradients in training
+        theta1 = to_tensor(theta1).requires_grad_()
+        theta2 = to_tensor(theta2).requires_grad_()
+        omega1 = to_tensor(omega1).requires_grad_()
+        omega2 = to_tensor(omega2).requires_grad_()
+        l1 = to_tensor(l1)
+        l2 = to_tensor(l2)
+        m1 = to_tensor(m1)
+        m2 = to_tensor(m2)
+        g = to_tensor(g)
+        drag1 = to_tensor(drag1)
+        drag2 = to_tensor(drag2)
+        amp1 = to_tensor(amp1)
+        amp2 = to_tensor(amp2)
+        freq1 = to_tensor(freq1)
+        freq2 = to_tensor(freq2)
+        t = to_tensor(0.0)
+    else:
+        def to_tensor(x, requires_grad=False):
+            return torch.as_tensor(x, dtype=torch.float64)
+        theta1 = to_tensor(theta1)
+        theta2 = to_tensor(theta2)
+        omega1 = to_tensor(omega1)
+        omega2 = to_tensor(omega2)
+        l1 = to_tensor(l1)
+        l2 = to_tensor(l2)
+        m1 = to_tensor(m1)
+        m2 = to_tensor(m2)
+        g = to_tensor(g)
+        drag1 = to_tensor(drag1)
+        drag2 = to_tensor(drag2)
+        amp1 = to_tensor(amp1)
+        amp2 = to_tensor(amp2)
+        freq1 = to_tensor(freq1)
+        freq2 = to_tensor(freq2)
+        t = to_tensor(0.0)
+    for _ in range(steps):
+        t = t + dt
+        delta = theta2 - theta1
+        denom1 = (m1 + m2) * l1 - m2 * l1 * torch.cos(delta) ** 2
+        denom2 = (l2 / l1) * denom1
+        drive1 = amp1 * torch.sin(2 * math.pi * freq1 * t)
+        drive2 = amp2 * torch.sin(2 * math.pi * freq2 * t)
+        domega1_dt = (
+            (m2 * l1 * omega1 ** 2 * torch.sin(delta) * torch.cos(delta)
+             + m2 * g * torch.sin(theta2) * torch.cos(delta)
+             + m2 * l2 * omega2 ** 2 * torch.sin(delta)
+             - (m1 + m2) * g * torch.sin(theta1)) / denom1
+            - drag1 * omega1
+            + drive1 / (m1 * l1 ** 2)
+        )
+        if m2.item() == 0:
+            domega2_dt = to_tensor(0.0)
+        else:
+            domega2_dt = (
+                (-m2 * l2 * omega2 ** 2 * torch.sin(delta) * torch.cos(delta)
+                 + (m1 + m2) * g * torch.sin(theta1) * torch.cos(delta)
+                 - (m1 + m2) * l1 * omega1 ** 2 * torch.sin(delta)
+                 - (m1 + m2) * g * torch.sin(theta2)) / denom2
+                - drag2 * omega2
+                + drive2 / (m2 * l2 ** 2)
+            )
+        omega1 = omega1 + domega1_dt * dt
+        omega2 = omega2 + domega2_dt * dt
+        theta1 = theta1 + omega1 * dt
+        theta2 = theta2 + omega2 * dt
+    x1 = l1 * torch.sin(theta1)
+    y1 = -l1 * torch.cos(theta1)
+    x2 = x1 + l2 * torch.sin(theta2)
+    y2 = y1 - l2 * torch.cos(theta2)
+    return theta1, theta2, omega1, omega2, x2, y2
+
+def train_controller():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Choose a random reachable point for the second mass
+    l1 = 1.0
+    l2 = 1.0
+    # The reachable area is a ring: r in [|l1-l2|, l1+l2], theta in [pi, 2pi]
+    r = np.random.uniform(1, l1 + l2)
+    theta = np.random.uniform(np.pi, 2 * np.pi)
+    global target_x_global, target_y_global
+    target_x_global = r * np.cos(theta)
+    target_y_global = -r * np.sin(theta)  # negative y is up in this convention
+    print(f"Target for mass 2: x={target_x_global:.3f}, y={target_y_global:.3f}")
+
+    def run_to_target(params, steps=steps, dt=0.01):
+        device = params[0].device if isinstance(params[0], torch.Tensor) else torch.device('cpu')
+        theta1 = params[6] * math.pi * 2 - math.pi
+        theta2 = params[7] * math.pi * 2 - math.pi
+        omega1 = 0.0
+        omega2 = 0.0
+        l1_val = 1.0
+        l2_val = 1.0
+        m1_val = 1.0
+        m2_val = 1.0
+        g_val = gravity
+        amp1, amp2, freq1, freq2, drag1, drag2 = params[0], params[1], params[2], params[3], params[4], params[5]
+        _, _, omega1f, omega2f, x2, y2 = integrate_double_pendulum(
+            theta1, theta2, omega1, omega2,
+            l1_val, l2_val, m1_val, m2_val, g_val,
+            drag1, drag2, amp1, amp2, freq1, freq2,
+            steps, dt, device=device
+        )
+        
+        global trained_theta1, trained_theta2, trained_damp1, trained_damp2, trained_amp1, trained_amp2, trained_freq1, trained_freq2
+        trained_theta1 = float(theta1)
+        trained_theta2 = float(theta2)
+        trained_damp1 = float(drag1)
+        trained_damp2 = float(drag2)
+        trained_amp1 = float(amp1)
+        trained_amp2 = float(amp2)
+        trained_freq1 = float(freq1)
+        trained_freq2 = float(freq2)
+
+        # Save params as before
+        np.save("optimized_params.npy", np.array([
+            amp1.item() if hasattr(amp1, 'item') else float(amp1),
+            amp2.item() if hasattr(amp2, 'item') else float(amp2),
+            freq1.item() if hasattr(freq1, 'item') else float(freq1),
+            freq2.item() if hasattr(freq2, 'item') else float(freq2),
+            drag1.item() if hasattr(drag1, 'item') else float(drag1),
+            drag2.item() if hasattr(drag2, 'item') else float(drag2),
+            params[6].item() if hasattr(params[6], 'item') else float(params[6]),
+            params[7].item() if hasattr(params[7], 'item') else float(params[7]),
+            0,
+            0
+        ]))
+        global final_x2, final_y2
+        final_x2, final_y2 = x2, y2
+        return x2, y2, omega1f, omega2f
+    
+    params = torch.nn.Parameter(torch.empty(10, device=device).uniform_(0, 0.5))
+    curr_best_params = params.clone()
+    curr_best_loss = 100
+    optimizer = optim.Adam([params], lr=0.01)
+    
+    for start in range(n_starts):
+        params = torch.nn.Parameter(torch.empty(10, device=device).uniform_(0, 1))
+        print(f"Starting nstart run {start+1}/{n_starts}")
+        amp1 = params[0].clamp(0, 0)
+        amp2 = params[1].clamp(0, 0)
+        freq1 = params[2].clamp(0, 2)
+        freq2 = params[3].clamp(0, 2)
+        drag1 = params[4].clamp(-2, 2)
+        drag2 = params[5].clamp(-2, 2)
+        theta1_init = params[6].clamp(0, 1)
+        theta2_init = params[7].clamp(0, 1)
+        param_list = [amp1, amp2, freq1, freq2, drag1, drag2, theta1_init, theta2_init]
+        x2, y2, omega1, omega2 = run_to_target(param_list, steps=steps, dt=0.01)
+        final_x2, final_y2 = x2, y2
+        dist = torch.sqrt((x2 - target_x_global) ** 2 + (y2 - target_y_global) ** 2)
+        loss = dist
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        
+    params = curr_best_params.clone().detach().requires_grad_()
+    optimizer = optim.Adam([params], lr=0.01)
+    for step in range(itterations):
+        # Clamp parameters to valid ranges
+        amp1 = params[0].clamp(0, 0)
+        amp2 = params[1].clamp(0, 0)
+        freq1 = params[2].clamp(0, 2)
+        freq2 = params[3].clamp(0, 2)
+        drag1 = params[4].clamp(0, 2)
+        drag2 = params[5].clamp(0, 2)
+        theta1_init = params[6].clamp(0, 1)
+        theta2_init = params[7].clamp(0, 1)
+        param_list = [amp1, amp2, freq1, freq2, drag1, drag2, theta1_init, theta2_init]
+        x2, y2, omega1, omega2 = run_to_target(param_list, steps=steps, dt=0.01)
+        final_x2, final_y2 = x2, y2
+        dist = torch.sqrt((x2 - target_x_global) ** 2 + (y2 - target_y_global) ** 2)
+        loss = dist
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        print(f"Step {step}/{itterations}: Loss = {loss.item():.4f}, target=({target_x_global:.2f},{target_y_global:.2f}), final=({x2.item():.2f},{y2.item():.2f}), final_speeds=({omega1.item():.2f},{omega2.item():.2f})")
 
 class DoublePendulum:
     def __init__(self, m1, m2, l1, l2, theta1, theta2, g=gravity):
@@ -31,8 +244,8 @@ class DoublePendulum:
         self.l2 = l2 
         self.g = g
 
-        self.theta1 = math.radians(theta1)
-        self.theta2 = math.radians(theta2)
+        self.theta1 = theta1
+        self.theta2 = theta2
         self.omega1 = 0
         self.omega2 = 0
 
@@ -43,65 +256,30 @@ class DoublePendulum:
             return
         if too_fast:
             return
-        # Time for driving force
-        if not hasattr(self, '_t'): self._t = 0
+        if not hasattr(self, '_t'):
+            self._t = 0
         self._t += dt
         t = self._t
-
-        m1 = torch.tensor(float(self.m1), dtype=torch.float64, requires_grad=True)
-        m2 = torch.tensor(float(self.m2), dtype=torch.float64, requires_grad=True)
-        l1 = torch.tensor(float(self.l1), dtype=torch.float64, requires_grad=True)
-        l2 = torch.tensor(float(self.l2), dtype=torch.float64, requires_grad=True)
-        theta1 = torch.tensor(float(self.theta1), dtype=torch.float64, requires_grad=True)
-        theta2 = torch.tensor(float(self.theta2), dtype=torch.float64, requires_grad=True)
-        omega1 = torch.tensor(float(self.omega1), dtype=torch.float64, requires_grad=True)
-        omega2 = torch.tensor(float(self.omega2), dtype=torch.float64, requires_grad=True)
-        g = torch.tensor(float(self.g), dtype=torch.float64)
-        drag1 = torch.tensor(float(drag_coefficient1), dtype=torch.float64)
-        drag2 = torch.tensor(float(drag_coefficient2), dtype=torch.float64)
-        drive1 = torch.tensor(float(driving_amplitude1 * math.sin(2 * math.pi * driving_frequency1 * t)), dtype=torch.float64)
-        drive2 = torch.tensor(float(driving_amplitude2 * math.sin(2 * math.pi * driving_frequency2 * t)), dtype=torch.float64)
-
-        delta = theta2 - theta1
-        denom1 = (m1 + m2) * l1 - m2 * l1 * torch.cos(delta) ** 2
-        denom2 = (l2 / l1) * denom1
-
-        domega1_dt = (
-            (m2 * l1 * omega1 ** 2 * torch.sin(delta) * torch.cos(delta)
-             + m2 * g * torch.sin(theta2) * torch.cos(delta)
-             + m2 * l2 * omega2 ** 2 * torch.sin(delta)
-             - (m1 + m2) * g * torch.sin(theta1)) / denom1
-            - drag1 * omega1
-            + drive1 / (m1 * l1 ** 2)
+        # Use the shared integration function for a single step
+        # Use float64 for GUI
+        theta1, theta2, omega1, omega2, _, _ = integrate_double_pendulum(
+            self.theta1, self.theta2, self.omega1, self.omega2,
+            self.l1, self.l2, self.m1, self.m2, self.g,
+            drag_coefficient1, drag_coefficient2,
+            driving_amplitude1, driving_amplitude2,
+            driving_frequency1, driving_frequency2,
+            steps=1, dt=dt, device=None
         )
-
-        if self.m2 == 0:
-            domega2_dt = torch.tensor(0.0, dtype=torch.float64)
-        else:
-            domega2_dt = (
-                (-m2 * l2 * omega2 ** 2 * torch.sin(delta) * torch.cos(delta)
-                 + (m1 + m2) * g * torch.sin(theta1) * torch.cos(delta)
-                 - (m1 + m2) * l1 * omega1 ** 2 * torch.sin(delta)
-                 - (m1 + m2) * g * torch.sin(theta2)) / denom2
-                - drag2 * omega2
-                + drive2 / (m2 * l2 ** 2)
-            )
-
-        # Update the python values for simulation
-        self.omega1 += domega1_dt.item() * dt
-        self.omega2 += domega2_dt.item() * dt
-        self.theta1 += self.omega1 * dt
-        self.theta2 += self.omega2 * dt
-
-        self.omega1 += domega1_dt * dt
-        self.omega2 += domega2_dt * dt
-        self.theta1 += self.omega1 * dt
-        self.theta2 += self.omega2 * dt
-
+        self.theta1 = theta1.item() if hasattr(theta1, 'item') else float(theta1)
+        self.theta2 = theta2.item() if hasattr(theta2, 'item') else float(theta2)
+        self.omega1 = omega1.item() if hasattr(omega1, 'item') else float(omega1)
+        self.omega2 = omega2.item() if hasattr(omega2, 'item') else float(omega2)
         # Detect excessive speed
         if abs(self.omega1) > FAST_OMEGA_THRESHOLD or abs(self.omega2) > FAST_OMEGA_THRESHOLD:
             too_fast = True
             playing = False
+        global curr_step
+        curr_step += 1
 
     def positions(self):
         x1 = self.l1 * math.sin(self.theta1)
@@ -109,7 +287,6 @@ class DoublePendulum:
         x2 = x1 + self.l2 * math.sin(self.theta2)
         y2 = y1 - self.l2 * math.cos(self.theta2)
         return x1, y1, x2, y2
-
 
 class DoublePendulumApp:
     def __init__(self, root, pendulum):
@@ -122,6 +299,30 @@ class DoublePendulumApp:
         self.canvas = tk.Canvas(root, width=800, height=600, bg="white")
         self.canvas.bind("<Configure>", self.on_resize)
         self.canvas.pack()
+
+        # Set a random target location in reachable area (same logic as train_controller)
+        l1 = 1.0
+        l2 = 1.0
+        import numpy as np
+        r = np.random.uniform(abs(l1 - l2), l1 + l2)
+        theta = np.random.uniform(0, 2 * np.pi)
+        self.target_x = r * np.cos(theta)
+        self.target_y = -r * np.sin(theta)
+        # Canvas item for the target box
+        self.target_box = None
+        self.final_box = None  # Add final_box attribute for red box
+
+        global driving_amplitude1, driving_amplitude2, driving_frequency1, driving_frequency2, drag_coefficient1, drag_coefficient2
+        driving_amplitude1 = trained_amp1
+        driving_amplitude2 = trained_amp2
+        driving_frequency1 = trained_freq1
+        driving_frequency2 = trained_freq2
+        drag_coefficient1 = trained_damp1
+        drag_coefficient2 = trained_damp2
+        # Also set initial positions globally if needed
+        global initial_theta1, initial_theta2, initial_omega1, initial_omega2
+        initial_theta1 = trained_theta1
+        initial_theta2 = trained_theta2
 
         # Checkbox to enable/disable second mass using enable_second_mass function
         self.second_mass_enabled = tk.BooleanVar(value=True)
@@ -209,8 +410,11 @@ class DoublePendulumApp:
         self.origin = (event.width // 2 + x_origin_offset, event.height // 2 + y_origin_offset)
 
     def update(self):
+        global gravity, drag_coefficient1, drag_coefficient2, driving_amplitude1, driving_amplitude2, driving_frequency1, driving_frequency2
         import time
         dt = 0.01
+    # Use the current global parameters for the system
+    # (If you want to update these from the optimizer, load them here)
         self.pendulum.step(dt)
         x1, y1, x2, y2 = self.pendulum.positions()
         x1_screen = self.origin[0] + x1 * 100
@@ -218,8 +422,45 @@ class DoublePendulumApp:
         x2_screen = self.origin[0] + x2 * 100
         y2_screen = self.origin[1] + y2 * 100
 
+        # Draw the target location as a black box
+        target_screen_x = self.origin[0] + target_x_global * 100
+        target_screen_y = self.origin[1] + target_y_global * 100
+        final_screen_x = self.origin[0] + final_x2 * 100
+        final_screen_y = self.origin[1] + final_y2 * 100
+        box_size = 10
+        # Draw black box for target
+        if not hasattr(self, 'target_box') or self.target_box is None:
+            self.target_box = self.canvas.create_rectangle(
+                float(target_screen_x) - box_size,
+                float(target_screen_y) - box_size,
+                float(target_screen_x) + box_size,
+                float(target_screen_y) + box_size,
+                fill="black"
+            )
+        else:
+            self.canvas.coords(
+                self.target_box,
+                float(target_screen_x) - box_size, float(target_screen_y) - box_size,
+                float(target_screen_x) + box_size, float(target_screen_y) + box_size
+            )
+        # Draw red box for final location
+        if not hasattr(self, 'final_box') or self.final_box is None:
+            self.final_box = self.canvas.create_rectangle(
+                float(final_screen_x) - box_size,
+                float(final_screen_y) - box_size,
+                float(final_screen_x) + box_size,
+                float(final_screen_y) + box_size,
+                fill="red"
+            )
+        else:
+            self.canvas.coords(
+                self.final_box,
+                float(final_screen_x) - box_size, float(final_screen_y) - box_size,
+                float(final_screen_x) + box_size, float(final_screen_y) + box_size
+            )
+
         # --- Sync sliders with their variables if changed externally ---
-        global gravity, drag_coefficient1, drag_coefficient2, driving_amplitude1, driving_amplitude2, driving_frequency1, driving_frequency2
+
         # Gravity
         if self._last_gravity != gravity:
             self.gravity_slider.set(gravity)
@@ -263,10 +504,39 @@ class DoublePendulumApp:
         else:
             self._last_freq2 = self.freq2_slider.get()
 
-        # Time for color animation
+        # Time for color animation and simulation looping
         if self.start_time is None:
             self.start_time = time.time()
         t = time.time() - self.start_time
+        global curr_step
+        if curr_step >= steps:
+            curr_step = 0
+            # Reset pendulum state, timer, and driving force time to specified initial values
+            param_path = "optimized_params.npy"
+            if os.path.exists(param_path):
+                params = np.load(param_path)
+                # Unpack all 10 parameters
+                amp1, amp2, freq1, freq2, drag1, drag2, theta1_init, theta2_init, omega1_init, omega2_init = params
+            else:
+                theta1_init = 0.5  # default normalized value
+                theta2_init = 0.5
+                # ...existing code for other defaults...
+            theta1_deg = theta1_init * 360 - 180
+            theta2_deg = theta2_init * 360 - 180
+            self.pendulum.m1 = 1.0
+            self.pendulum.m2 = 1.0
+            self.pendulum.l1 = 1.0
+            self.pendulum.l2 = 1.0
+            self.pendulum.theta1 = trained_theta1
+            self.pendulum.theta2 = trained_theta2
+            self.pendulum.omega1 = 0.0
+            self.pendulum.omega2 = 0.0
+            if hasattr(self.pendulum, '_t'):
+                self.pendulum._t = 0.0
+            self.start_time = time.time()
+            global too_fast, playing
+            too_fast = False
+            playing = True
 
         # Calculate color for line1 (driving force 1)
         amp1 = driving_amplitude1
@@ -464,9 +734,13 @@ def enable_second_mass():
         app.pendulum.m2 = 0
 
 if __name__ == "__main__":
+    train_controller()
+
+if __name__ == "__main__":
     global dp, app
 
-    dp = DoublePendulum(m1=1.0, m2=1.0, l1=1.0, l2=1.0, theta1=120, theta2=90)
+    param_path = "optimized_params.npy"
+    dp = DoublePendulum(m1=1.0, m2=1.0, l1=1.0, l2=1.0, theta1=trained_theta1, theta2=trained_theta2)
     root = tk.Tk()
     app = DoublePendulumApp(root, dp)
     root.bind("<KeyPress-space>", toggle_playing)
@@ -475,4 +749,3 @@ if __name__ == "__main__":
     root.bind("<ButtonRelease-1>", release)
     root.bind("<KeyPress-r>", reset)
     root.mainloop()
-    
